@@ -1,0 +1,30 @@
+# Defaults. Override per model with a file in values/ - see values/churn-classifier.yaml
+modelName: ""          # required, e.g. churn-classifier
+modelVersion: ""       # required, e.g. "3"
+
+image:
+  repository: ""       # set by the workflow: ghcr.io/<owner>/<repo>/<model>
+  tag: ""              # set by the workflow: v<modelVersion>
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+replicaCount: 1
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits:   { cpu: 500m, memory: 512Mi }
+
+service:
+  port: 8000
+
+ingress:
+  enabled: true
+  className: traefik
+  # Final host is <modelName>.<hostSuffix>, e.g. churn-classifier.192.168.10.180.nip.io
+  hostSuffix: ""
+
+# Lets Prometheus discover /metrics automatically
+serviceMonitor:
+  enabled: true
+  interval: 30s

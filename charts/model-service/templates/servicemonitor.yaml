@@ -1,0 +1,16 @@
+{{- if .Values.serviceMonitor.enabled }}
+# Prometheus (kube-prometheus-stack) watches all namespaces, so this is all
+# that is needed for the model's metrics to appear in Grafana.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "model-service.name" . }}
+  labels: {{- include "model-service.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{- include "model-service.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

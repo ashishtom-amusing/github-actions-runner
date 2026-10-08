@@ -1,0 +1,6 @@
+apiVersion: v2
+name: model-service
+description: Generic chart for a model inference service. One release per model.
+type: application
+version: 0.1.0
+appVersion: "1.0"

@@ -1,0 +1,11 @@
+# Pinned so a rebuild months from now produces the same image.
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+prometheus-client==0.26.0
+
+# mlflow-skinny is ~20x smaller than full mlflow and is all that is needed
+# to LOAD a model. scikit-learn + skops are what the sklearn flavour unpickles with.
+mlflow-skinny==3.16.1
+scikit-learn==1.8.0
+pandas==3.0.2
+skops==0.16.0

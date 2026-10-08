@@ -1,0 +1,12 @@
+# Per-model overrides. Copy this file for each new model; the chart is shared.
+# image.repository/tag, modelVersion and ingress.hostSuffix are set by the
+# workflow at deploy time, so they stay empty here.
+replicaCount: 1
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits:   { cpu: 500m, memory: 512Mi }
+
+serviceMonitor:
+  enabled: true
+  interval: 30s

@@ -1,0 +1,125 @@
+name: Build and deploy model
+
+# Triggered by Airflow DAG 2 after the human approval, or by hand from the
+# Actions tab (handy for the first run and for demos).
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: "Registered model name in MLflow"
+        required: true
+        default: "churn-classifier"
+      model_version:
+        description: "Model version to deploy"
+        required: true
+        default: "1"
+
+# Everything runs on the self-hosted runner: MLflow sits on a private network
+# that GitHub-hosted runners cannot reach.
+jobs:
+  deploy:
+    runs-on: [self-hosted, mana-k3s]
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      MODEL_NAME: ${{ inputs.model_name }}
+      MODEL_VERSION: ${{ inputs.model_version }}
+      MLFLOW_URL: ${{ vars.MLFLOW_URL }}
+      NODE_IP: ${{ vars.NODE_IP }}
+      IMAGE: ghcr.io/${{ github.repository }}/${{ inputs.model_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch model from the MLflow registry
+        env:
+          MLFLOW_TRACKING_USERNAME: admin
+          MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/mlvenv
+          /tmp/mlvenv/bin/pip install --quiet "mlflow-skinny==3.16.1" boto3
+          rm -rf service/model
+          MLFLOW_TRACKING_URI="${MLFLOW_URL}" /tmp/mlvenv/bin/python - <<'PY'
+          import os
+          import mlflow
+
+          name = os.environ["MODEL_NAME"]
+          version = os.environ["MODEL_VERSION"]
+          path = mlflow.artifacts.download_artifacts(
+              artifact_uri=f"models:/{name}/{version}",
+              dst_path="service/model",
+          )
+          print(f"Downloaded {name} v{version} to {path}")
+          PY
+          # MLmodel is the manifest every MLflow model has; its absence means
+          # the download silently produced nothing useful.
+          test -f service/model/MLmodel || { echo "No MLmodel file - download failed"; exit 1; }
+          du -sh service/model
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          TAG="v${MODEL_VERSION}"
+          docker build -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" ./service
+          docker push "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:latest"
+          echo "Pushed ${IMAGE}:${TAG}"
+
+      - name: Deploy to Kubernetes
+        run: |
+          set -euo pipefail
+          helm upgrade --install "${MODEL_NAME}" ./charts/model-service \
+            --namespace ml-apps \
+            -f "values/${MODEL_NAME}.yaml" \
+            --set modelName="${MODEL_NAME}" \
+            --set modelVersion="${MODEL_VERSION}" \
+            --set image.repository="${IMAGE}" \
+            --set image.tag="v${MODEL_VERSION}" \
+            --set ingress.hostSuffix="${NODE_IP}.nip.io" \
+            --wait --timeout 5m
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          HOST="${MODEL_NAME}.${NODE_IP}.nip.io"
+
+          echo "--- /health"
+          curl -sf -H "Host: ${HOST}" http://127.0.0.1/health | tee /tmp/health.json
+          echo
+
+          echo "--- /info"
+          curl -sf -H "Host: ${HOST}" http://127.0.0.1/info
+          echo
+
+          echo "--- /predict"
+          curl -sf -X POST -H "Host: ${HOST}" -H "Content-Type: application/json" \
+            -d '{"records":[{"tenure_months":5,"monthly_charges":89.4,"support_calls":3,"contract":"month-to-month","internet_service":"fiber","payment_method":"e-check"}]}' \
+            http://127.0.0.1/predict
+          echo
+
+          # The pod must report the version we just deployed, not a stale one.
+          SERVING=$(grep -o '"version":"[^"]*"' /tmp/health.json | head -1 | cut -d'"' -f4)
+          if [ "${SERVING}" != "${MODEL_VERSION}" ]; then
+            echo "Expected version ${MODEL_VERSION} but the pod reports ${SERVING}"
+            exit 1
+          fi
+          echo "Smoke test passed - serving version ${SERVING}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${MODEL_NAME} v${MODEL_VERSION}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${IMAGE}:v${MODEL_VERSION}\` |"
+            echo "| Endpoint | http://${MODEL_NAME}.${NODE_IP}.nip.io |"
+            echo "| Namespace | ml-apps |"
+          } >> "${GITHUB_STEP_SUMMARY}"
