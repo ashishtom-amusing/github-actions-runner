@@ -37,6 +37,7 @@ jobs:
         env:
           MLFLOW_TRACKING_USERNAME: admin
           MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_PASSWORD }}
+          MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD: "false"
         run: |
           set -euo pipefail
           python3 -m venv /tmp/mlvenv
