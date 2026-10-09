@@ -100,7 +100,7 @@ jobs:
 
           echo "--- /predict"
           curl -sf -X POST -H "Host: ${HOST}" -H "Content-Type: application/json" \
-            -d '{"records":[{"tenure_months":5,"monthly_charges":89.4,"support_calls":3,"contract":"month-to-month","internet_service":"fiber","payment_method":"e-check"}]}' \
+            -d '{"rows":[{"tenure_months":5,"monthly_charges":89.4,"support_calls":3,"contract":"month-to-month","internet_service":"fiber","payment_method":"e-check"}]}' \
             http://127.0.0.1/predict
           echo
 
