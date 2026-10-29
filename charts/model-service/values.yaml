@@ -2,6 +2,11 @@
 modelName: ""          # required, e.g. churn-classifier
 modelVersion: ""       # required, e.g. "3"
 
+# champion serves live traffic. challenger receives a mirrored copy of it
+# (shadow deployment) and its answers are logged but never returned.
+# Resource names: champion -> <modelName>, challenger -> <modelName>-challenger
+role: champion
+
 image:
   repository: ""       # set by the workflow: ghcr.io/<owner>/<repo>/<model>
   tag: ""              # set by the workflow: v<modelVersion>
@@ -13,7 +18,7 @@ replicaCount: 1
 
 resources:
   requests: { cpu: 100m, memory: 256Mi }
-  limits:   { cpu: 500m, memory: 512Mi }
+  limits:   { cpu: 500m, memory: 768Mi }
 
 service:
   port: 8000
@@ -21,10 +26,27 @@ service:
 ingress:
   enabled: true
   className: traefik
-  # Final host is <modelName>.<hostSuffix>, e.g. churn-classifier.192.168.10.180.nip.io
+  # Final host is <release name>.<hostSuffix>, e.g. churn-classifier.192.168.10.180.nip.io
   hostSuffix: ""
 
-# Lets Prometheus discover /metrics automatically
 serviceMonitor:
   enabled: true
   interval: 30s
+
+# Every prediction is written to object storage for drift monitoring,
+# outcome joining and retraining. Credentials come from s3SecretName.
+predictionLog:
+  enabled: true
+  bucket: predictions
+  s3Endpoint: http://seaweedfs.mlops.svc.cluster.local:8333
+  s3SecretName: s3-credentials
+  batchSize: 500
+  flushSeconds: 30
+
+# Champion only: mirror traffic to <modelName>-challenger when one is healthy.
+shadow:
+  enabled: true
+  timeoutSeconds: 2
+  maxInflight: 32
+
+terminationGracePeriodSeconds: 30

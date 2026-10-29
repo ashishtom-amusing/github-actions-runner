@@ -1,7 +1,9 @@
 name: Build and deploy model
 
-# Triggered by Airflow DAG 2 after the human approval, or by hand from the
-# Actions tab (handy for the first run and for demos).
+# Dispatched by the Airflow <model>__promote DAG after deployment approval,
+# or by hand from the Actions tab.
+#   role=champion    -> release <model>             serves live traffic
+#   role=challenger  -> release <model>-challenger  receives mirrored traffic only
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +15,12 @@ on:
         description: "Model version to deploy"
         required: true
         default: "1"
+      role:
+        description: "champion serves traffic; challenger shadows it"
+        required: true
+        default: "champion"
+        type: choice
+        options: [champion, challenger]
 
 # Everything runs on the self-hosted runner: MLflow sits on a private network
 # that GitHub-hosted runners cannot reach.
@@ -22,10 +30,14 @@ jobs:
     permissions:
       contents: read
       packages: write
+    concurrency:
+      group: deploy-${{ inputs.model_name }}-${{ inputs.role }}
+      cancel-in-progress: false
 
     env:
       MODEL_NAME: ${{ inputs.model_name }}
       MODEL_VERSION: ${{ inputs.model_version }}
+      ROLE: ${{ inputs.role }}
       MLFLOW_URL: ${{ vars.MLFLOW_URL }}
       NODE_IP: ${{ vars.NODE_IP }}
       IMAGE: ghcr.io/${{ github.repository }}/${{ inputs.model_name }}
@@ -33,10 +45,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve release name
+        run: |
+          if [ "${ROLE}" = "champion" ]; then RELEASE="${MODEL_NAME}"; else RELEASE="${MODEL_NAME}-${ROLE}"; fi
+          echo "RELEASE=${RELEASE}" >> "${GITHUB_ENV}"
+          echo "Deploying ${MODEL_NAME} v${MODEL_VERSION} as ${ROLE} -> release ${RELEASE}"
+
+      - name: Check prediction-log credentials
+        run: |
+          kubectl -n ml-apps get secret s3-credentials >/dev/null 2>&1 \
+            && echo "s3-credentials present" \
+            || echo "::warning::Secret s3-credentials missing in ml-apps - prediction logging will be off. Run scripts/phase3a-foundations.sh"
+
       - name: Fetch model from the MLflow registry
         env:
           MLFLOW_TRACKING_USERNAME: admin
           MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_PASSWORD }}
+          # MLflow otherwise hands out presigned S3 URLs pointing at the
+          # in-cluster SeaweedFS name, which the runner host cannot resolve.
           MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD: "false"
         run: |
           set -euo pipefail
@@ -47,17 +73,14 @@ jobs:
           import os
           import mlflow
 
-          name = os.environ["MODEL_NAME"]
-          version = os.environ["MODEL_VERSION"]
+          name, version = os.environ["MODEL_NAME"], os.environ["MODEL_VERSION"]
           path = mlflow.artifacts.download_artifacts(
-              artifact_uri=f"models:/{name}/{version}",
-              dst_path="service/model",
-          )
+              artifact_uri=f"models:/{name}/{version}", dst_path="service/model")
           print(f"Downloaded {name} v{version} to {path}")
           PY
-          # MLmodel is the manifest every MLflow model has; its absence means
-          # the download silently produced nothing useful.
           test -f service/model/MLmodel || { echo "No MLmodel file - download failed"; exit 1; }
+          test -f service/model/requirements.txt || { echo "No requirements.txt in model"; exit 1; }
+          echo "--- model requirements"; cat service/model/requirements.txt
           du -sh service/model
 
       - name: Log in to GHCR
@@ -67,19 +90,19 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v${MODEL_VERSION}"
-          docker build -t "${IMAGE}:${TAG}" -t "${IMAGE}:latest" ./service
+          docker build -t "${IMAGE}:${TAG}" ./service
           docker push "${IMAGE}:${TAG}"
-          docker push "${IMAGE}:latest"
           echo "Pushed ${IMAGE}:${TAG}"
 
       - name: Deploy to Kubernetes
         run: |
           set -euo pipefail
-          helm upgrade --install "${MODEL_NAME}" ./charts/model-service \
+          helm upgrade --install "${RELEASE}" ./charts/model-service \
             --namespace ml-apps \
             -f "values/${MODEL_NAME}.yaml" \
             --set modelName="${MODEL_NAME}" \
             --set modelVersion="${MODEL_VERSION}" \
+            --set role="${ROLE}" \
             --set image.repository="${IMAGE}" \
             --set image.tag="v${MODEL_VERSION}" \
             --set ingress.hostSuffix="${NODE_IP}.nip.io" \
@@ -88,39 +111,52 @@ jobs:
       - name: Smoke test
         run: |
           set -euo pipefail
-          HOST="${MODEL_NAME}.${NODE_IP}.nip.io"
+          HOST="${RELEASE}.${NODE_IP}.nip.io"
 
           echo "--- /health"
-          curl -sf -H "Host: ${HOST}" http://127.0.0.1/health | tee /tmp/health.json
-          echo
-
+          curl -sf -H "Host: ${HOST}" http://127.0.0.1/health | tee /tmp/health.json; echo
           echo "--- /info"
-          curl -sf -H "Host: ${HOST}" http://127.0.0.1/info
-          echo
-
+          curl -sf -H "Host: ${HOST}" http://127.0.0.1/info | tee /tmp/info.json; echo
           echo "--- /predict"
           curl -sf -X POST -H "Host: ${HOST}" -H "Content-Type: application/json" \
             -d '{"rows":[{"tenure_months":5,"monthly_charges":89.4,"support_calls":3,"contract":"month-to-month","internet_service":"fiber","payment_method":"e-check"}]}' \
-            http://127.0.0.1/predict
-          echo
+            http://127.0.0.1/predict; echo
 
-          # The pod must report the version we just deployed, not a stale one.
           SERVING=$(grep -o '"version":"[^"]*"' /tmp/health.json | head -1 | cut -d'"' -f4)
-          if [ "${SERVING}" != "${MODEL_VERSION}" ]; then
-            echo "Expected version ${MODEL_VERSION} but the pod reports ${SERVING}"
+          SERVING_ROLE=$(grep -o '"role":"[^"]*"' /tmp/health.json | head -1 | cut -d'"' -f4)
+          if [ "${SERVING}" != "${MODEL_VERSION}" ] || [ "${SERVING_ROLE}" != "${ROLE}" ]; then
+            echo "Expected v${MODEL_VERSION} as ${ROLE}, pod reports v${SERVING} as ${SERVING_ROLE}"
             exit 1
           fi
-          echo "Smoke test passed - serving version ${SERVING}"
+          grep -q '"enabled":true' /tmp/info.json \
+            && echo "Prediction logging enabled" \
+            || echo "::warning::Prediction logging is disabled on this pod"
+          echo "Smoke test passed - v${SERVING} serving as ${SERVING_ROLE}"
+
+      - name: Wait for the champion to start mirroring
+        if: inputs.role == 'challenger'
+        run: |
+          HOST="${MODEL_NAME}.${NODE_IP}.nip.io"
+          for i in $(seq 1 12); do
+            if curl -sf -H "Host: ${HOST}" http://127.0.0.1/info | grep -q '"active":true'; then
+              echo "Champion is mirroring traffic to the challenger"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::warning::Champion has not picked up the challenger after 60s. Is the champion on the phase 3 image?"
 
       - name: Summary
         if: always()
         run: |
           {
-            echo "### ${MODEL_NAME} v${MODEL_VERSION}"
+            echo "### ${MODEL_NAME} v${MODEL_VERSION} as ${ROLE}"
             echo ""
             echo "| | |"
             echo "|---|---|"
+            echo "| Release | \`${RELEASE}\` |"
             echo "| Image | \`${IMAGE}:v${MODEL_VERSION}\` |"
-            echo "| Endpoint | http://${MODEL_NAME}.${NODE_IP}.nip.io |"
-            echo "| Namespace | ml-apps |"
+            echo "| Endpoint | http://${RELEASE}.${NODE_IP}.nip.io |"
+            if [ "${ROLE}" = "challenger" ]; then
+              echo "| Traffic | shadow - mirrored from the champion, answers not returned |"
+            fi
           } >> "${GITHUB_STEP_SUMMARY}"

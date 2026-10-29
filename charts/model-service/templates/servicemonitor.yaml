@@ -4,7 +4,7 @@
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "model-service.name" . }}
+  name: {{ include "model-service.fullname" . }}
   labels: {{- include "model-service.labels" . | nindent 4 }}
 spec:
   selector:
