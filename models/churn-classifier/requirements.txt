@@ -1,0 +1,8 @@
+# Pinned: these versions are recorded in every model this trainer produces,
+# and the serving image installs the same ones.
+mlflow==3.16.1
+scikit-learn==1.8.0
+skops==0.16.0
+pandas==3.0.2
+pyarrow==25.0.1
+boto3>=1.35

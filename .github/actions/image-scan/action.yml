@@ -1,0 +1,63 @@
+name: Image scan
+description: >-
+  Scan a pushed image with Trivy and write an SBOM. Trivy is downloaded at a
+  pinned version and checked against its published sha256 (supply-chain
+  hygiene: never pipe an install script into a shell).
+inputs:
+  image:
+    description: Image reference (tag or digest)
+    required: true
+  enforce:
+    description: "true = fail on fixable CRITICAL findings; false = report only"
+    required: false
+    default: "true"
+outputs:
+  sbom:
+    description: Path of the CycloneDX SBOM
+    value: ${{ steps.scan.outputs.sbom }}
+runs:
+  using: composite
+  steps:
+    - name: Install Trivy (pinned, checksum-verified)
+      shell: bash
+      env:
+        TRIVY_VERSION: "0.69.3"
+        TRIVY_SHA256: "1816b632dfe529869c740c0913e36bd1629cb7688bd5634f4a858c1d57c88b75"
+      run: |
+        set -euo pipefail
+        DIR="${RUNNER_TOOL_CACHE:-$RUNNER_TEMP}/trivy-${TRIVY_VERSION}"
+        if [ ! -x "${DIR}/trivy" ]; then
+          mkdir -p "${DIR}"
+          TGZ="${RUNNER_TEMP}/trivy.tgz"
+          curl -sSfL -o "${TGZ}" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  ${TGZ}" | sha256sum -c -
+          tar -xzf "${TGZ}" -C "${DIR}" trivy
+        fi
+        echo "${DIR}" >> "${GITHUB_PATH}"
+        "${DIR}/trivy" --version | head -1
+
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        ENFORCE: ${{ inputs.enforce }}
+        TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+      run: |
+        set -euo pipefail
+        SBOM="${RUNNER_TEMP}/sbom-$(echo "${IMAGE##*/}" | tr ':@' '--').cdx.json"
+        trivy image --quiet --format cyclonedx --output "${SBOM}" "${IMAGE}"
+        echo "sbom=${SBOM}" >> "${GITHUB_OUTPUT}"
+        trivy image --quiet --severity HIGH,CRITICAL --ignore-unfixed --format table "${IMAGE}" \
+          | tee "${RUNNER_TEMP}/trivy.txt"
+        {
+          echo "### Image scan: \`${IMAGE}\`"
+          echo '```'
+          tail -n 40 "${RUNNER_TEMP}/trivy.txt"
+          echo '```'
+        } >> "${GITHUB_STEP_SUMMARY}"
+        if [ "${ENFORCE}" = "true" ]; then
+          trivy image --quiet --severity CRITICAL --ignore-unfixed --exit-code 1 --format table "${IMAGE}" >/dev/null \
+            || { echo "::error::Fixable CRITICAL vulnerabilities in ${IMAGE} - rebuild on a patched base image"; exit 1; }
+        fi

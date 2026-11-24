@@ -1,0 +1,47 @@
+{{- if eq (include "model-service.useRollout" .) "true" }}
+{{- $a := .Values.rollout.analysis }}
+{{- $sel := printf "model=\"%s\",role=\"champion\",version=\"{{args.version}}\"" (include "model-service.model" .) }}
+# Operational health of the canary pods only (label version = the new model).
+# Quality was already proven in shadow; this checks it is safe to serve.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: {{ include "model-service.fullname" . }}-canary-health
+  labels: {{- include "model-service.labels" . | nindent 4 }}
+spec:
+  args:
+    - name: version
+  metrics:
+    - name: has-traffic
+      # No traffic = no evidence = no promotion.
+      interval: {{ $a.interval }}
+      count: {{ $a.count }}
+      failureLimit: 1
+      successCondition: result[0] >= {{ $a.minRequests }}
+      provider:
+        prometheus:
+          address: {{ $a.prometheusAddress }}
+          query: sum(increase(model_prediction_latency_seconds_count{ {{- $sel -}} }[{{ $a.window }}])) or vector(0)
+    - name: error-rate
+      interval: {{ $a.interval }}
+      count: {{ $a.count }}
+      failureLimit: 1
+      successCondition: result[0] <= {{ $a.maxErrorRate }}
+      provider:
+        prometheus:
+          address: {{ $a.prometheusAddress }}
+          query: >-
+            (sum(rate(model_prediction_errors_total{ {{- $sel -}} }[{{ $a.window }}])) or vector(0))
+            / clamp_min(sum(rate(model_prediction_latency_seconds_count{ {{- $sel -}} }[{{ $a.window }}])) or vector(0), 0.001)
+    - name: p95-latency
+      interval: {{ $a.interval }}
+      count: {{ $a.count }}
+      failureLimit: 1
+      successCondition: isNaN(result[0]) || result[0] <= {{ $a.maxP95LatencySeconds }}
+      provider:
+        prometheus:
+          address: {{ $a.prometheusAddress }}
+          query: >-
+            histogram_quantile(0.95, sum by (le) (rate(model_prediction_latency_seconds_bucket{ {{- $sel -}} }[{{ $a.window }}])))
+            or vector(0)
+{{- end }}

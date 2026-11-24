@@ -25,3 +25,22 @@ mlops/role: {{ .Values.role }}
 {{- define "model-service.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "model-service.fullname" . }}
 {{- end -}}
+
+{{/*
+"true" when the champion should be an Argo Rollout (canary) instead of a
+Deployment. rollout.enabled: auto = only if Argo Rollouts is installed, so the
+same chart works before and after phase 3E. Challengers are never canaried:
+they take no user traffic.
+*/}}
+{{- define "model-service.useRollout" -}}
+{{- $mode := toString .Values.rollout.enabled -}}
+{{- if and (eq .Values.role "champion") (or (eq $mode "true") (and (eq $mode "auto") (.Capabilities.APIVersions.Has "argoproj.io/v1alpha1/Rollout"))) -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{- define "model-service.host" -}}
+{{- .Values.ingress.hostSuffix | required "ingress.hostSuffix is required" -}}
+{{- end -}}

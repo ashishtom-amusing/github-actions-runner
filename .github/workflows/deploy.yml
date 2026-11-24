@@ -1,9 +1,15 @@
 name: Build and deploy model
 
-# Dispatched by the Airflow <model>__promote DAG after deployment approval,
-# or by hand from the Actions tab.
-#   role=champion    -> release <model>             serves live traffic
-#   role=challenger  -> release <model>-challenger  receives mirrored traffic only
+# Continuous delivery for model versions. Dispatched by Airflow after a human
+# approval, or by hand from the Actions tab.
+#
+#   role=challenger  release <model>-challenger  shadow: mirrored traffic only
+#   role=champion    release <model>             serves users
+#                    - plain Deployment before phase 3E
+#                    - Argo Rollouts canary once Argo Rollouts is installed:
+#                      traffic moves in steps, Prometheus analysis between
+#                      steps, automatic rollback
+#   action=retire    removes the challenger after it has been promoted
 on:
   workflow_dispatch:
     inputs:
@@ -21,12 +27,25 @@ on:
         default: "champion"
         type: choice
         options: [champion, challenger]
+      action:
+        description: "deploy, or retire (challenger only)"
+        required: false
+        default: "deploy"
+        type: choice
+        options: [deploy, retire]
+      chaos:
+        description: "DEMO ONLY: inject faults into this version (canary should roll back)"
+        required: false
+        default: "none"
+        type: choice
+        options: [none, errors, slow]
 
-# Everything runs on the self-hosted runner: MLflow sits on a private network
-# that GitHub-hosted runners cannot reach.
+# Everything runs on the self-hosted runner: MLflow and the cluster sit on a
+# private network that GitHub-hosted runners cannot reach.
 jobs:
   deploy:
     runs-on: [self-hosted, mana-k3s]
+    timeout-minutes: 75
     permissions:
       contents: read
       packages: write
@@ -38,26 +57,57 @@ jobs:
       MODEL_NAME: ${{ inputs.model_name }}
       MODEL_VERSION: ${{ inputs.model_version }}
       ROLE: ${{ inputs.role }}
+      ACTION: ${{ inputs.action || 'deploy' }}
+      CHAOS: ${{ inputs.chaos || 'none' }}
       MLFLOW_URL: ${{ vars.MLFLOW_URL }}
       NODE_IP: ${{ vars.NODE_IP }}
       IMAGE: ghcr.io/${{ github.repository }}/${{ inputs.model_name }}
+      # Unique per build: a reused tag can be served from a node's image cache.
+      TAG: v${{ inputs.model_version }}-r${{ github.run_number }}
+      NS: ml-apps
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve release name
+      - name: Resolve release and mode
         run: |
+          set -euo pipefail
           if [ "${ROLE}" = "champion" ]; then RELEASE="${MODEL_NAME}"; else RELEASE="${MODEL_NAME}-${ROLE}"; fi
-          echo "RELEASE=${RELEASE}" >> "${GITHUB_ENV}"
-          echo "Deploying ${MODEL_NAME} v${MODEL_VERSION} as ${ROLE} -> release ${RELEASE}"
+          CANARY=false
+          if [ "${ROLE}" = "champion" ] && kubectl get crd rollouts.argoproj.io >/dev/null 2>&1; then CANARY=true; fi
+          PREV=$(helm -n "${NS}" history "${RELEASE}" -o json 2>/dev/null \
+                 | python3 -c "import json,sys; h=json.load(sys.stdin); print(h[-1]['revision'] if h else '')" || true)
+          {
+            echo "RELEASE=${RELEASE}"
+            echo "CANARY=${CANARY}"
+            echo "PREV_REVISION=${PREV}"
+          } >> "${GITHUB_ENV}"
+          echo "${ACTION} ${MODEL_NAME} v${MODEL_VERSION} as ${ROLE} -> release ${RELEASE} (canary=${CANARY}, previous revision ${PREV:-none})"
 
-      - name: Check prediction-log credentials
+      # ------------------------------------------------------------ retire
+      - name: Retire challenger
+        if: env.ACTION == 'retire'
         run: |
-          kubectl -n ml-apps get secret s3-credentials >/dev/null 2>&1 \
+          set -euo pipefail
+          [ "${ROLE}" = "challenger" ] || { echo "::error::Only a challenger can be retired"; exit 1; }
+          if helm -n "${NS}" status "${RELEASE}" >/dev/null 2>&1; then
+            helm -n "${NS}" uninstall "${RELEASE}" --wait --timeout 3m
+            echo "Uninstalled ${RELEASE}; the champion stops mirroring within 30s"
+          else
+            echo "${RELEASE} is not installed - nothing to do"
+          fi
+          echo "### Retired \`${RELEASE}\`" >> "${GITHUB_STEP_SUMMARY}"
+
+      # ------------------------------------------------------------ build
+      - name: Check prediction-log credentials
+        if: env.ACTION == 'deploy'
+        run: |
+          kubectl -n "${NS}" get secret s3-credentials >/dev/null 2>&1 \
             && echo "s3-credentials present" \
-            || echo "::warning::Secret s3-credentials missing in ml-apps - prediction logging will be off. Run scripts/phase3a-foundations.sh"
+            || echo "::warning::Secret s3-credentials missing in ${NS} - prediction logging will be off"
 
       - name: Fetch model from the MLflow registry
+        if: env.ACTION == 'deploy'
         env:
           MLFLOW_TRACKING_USERNAME: admin
           MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_PASSWORD }}
@@ -66,10 +116,11 @@ jobs:
           MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD: "false"
         run: |
           set -euo pipefail
-          python3 -m venv /tmp/mlvenv
-          /tmp/mlvenv/bin/pip install --quiet "mlflow-skinny==3.16.1" boto3
+          VENV="${RUNNER_TEMP}/mlvenv"
+          python3 -m venv --clear "${VENV}"
+          "${VENV}/bin/pip" install --quiet "mlflow-skinny==3.16.1" boto3
           rm -rf service/model
-          MLFLOW_TRACKING_URI="${MLFLOW_URL}" /tmp/mlvenv/bin/python - <<'PY'
+          MLFLOW_TRACKING_URI="${MLFLOW_URL}" "${VENV}/bin/python" - <<'PY'
           import os
           import mlflow
 
@@ -84,60 +135,133 @@ jobs:
           du -sh service/model
 
       - name: Log in to GHCR
+        if: env.ACTION == 'deploy'
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build and push image
+        if: env.ACTION == 'deploy'
         run: |
           set -euo pipefail
-          TAG="v${MODEL_VERSION}"
-          docker build -t "${IMAGE}:${TAG}" ./service
+          docker build \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "mlops.model=${MODEL_NAME}" --label "mlops.model-version=${MODEL_VERSION}" \
+            -t "${IMAGE}:${TAG}" ./service
           docker push "${IMAGE}:${TAG}"
-          echo "Pushed ${IMAGE}:${TAG}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${TAG}")
+          echo "DIGEST=${DIGEST}" >> "${GITHUB_ENV}"
+          echo "Pushed ${IMAGE}:${TAG} (${DIGEST})"
 
+      - name: Scan image
+        if: env.ACTION == 'deploy'
+        id: scan
+        uses: ./.github/actions/image-scan
+        with:
+          image: ${{ env.IMAGE }}:${{ env.TAG }}
+          enforce: ${{ vars.IMAGE_SCAN_ENFORCE || 'true' }}
+
+      - name: Keep the SBOM
+        if: env.ACTION == 'deploy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ inputs.model_name }}-v${{ inputs.model_version }}
+          path: ${{ steps.scan.outputs.sbom }}
+          retention-days: 30
+
+      # ------------------------------------------------------------ deploy
       - name: Deploy to Kubernetes
+        if: env.ACTION == 'deploy'
         run: |
           set -euo pipefail
+          # The image is pinned by digest: what was scanned is what runs.
           helm upgrade --install "${RELEASE}" ./charts/model-service \
-            --namespace ml-apps \
+            --namespace "${NS}" \
             -f "values/${MODEL_NAME}.yaml" \
             --set modelName="${MODEL_NAME}" \
             --set modelVersion="${MODEL_VERSION}" \
             --set role="${ROLE}" \
             --set image.repository="${IMAGE}" \
-            --set image.tag="v${MODEL_VERSION}" \
+            --set image.tag="${TAG}@${DIGEST#*@}" \
             --set ingress.hostSuffix="${NODE_IP}.nip.io" \
+            --set chaos="${CHAOS}" \
             --wait --timeout 5m
 
       - name: Smoke test
+        if: env.ACTION == 'deploy'
         run: |
           set -euo pipefail
-          HOST="${RELEASE}.${NODE_IP}.nip.io"
-
-          echo "--- /health"
-          curl -sf -H "Host: ${HOST}" http://127.0.0.1/health | tee /tmp/health.json; echo
+          # Canary mode: test the new pods on the preview host before users see them.
+          if [ "${CANARY}" = "true" ]; then HOST="${RELEASE}-canary.${NODE_IP}.nip.io"; else HOST="${RELEASE}.${NODE_IP}.nip.io"; fi
+          echo "Waiting for v${MODEL_VERSION} on ${HOST}"
+          for _ in $(seq 1 60); do
+            if curl -sf -H "Host: ${HOST}" http://127.0.0.1/health -o "${RUNNER_TEMP}/health.json" \
+               && grep -q "\"version\":\"${MODEL_VERSION}\"" "${RUNNER_TEMP}/health.json"; then break; fi
+            sleep 5
+          done
+          echo "--- /health"; cat "${RUNNER_TEMP}/health.json"; echo
           echo "--- /info"
-          curl -sf -H "Host: ${HOST}" http://127.0.0.1/info | tee /tmp/info.json; echo
+          curl -sf -H "Host: ${HOST}" http://127.0.0.1/info | tee "${RUNNER_TEMP}/info.json"; echo
           echo "--- /predict"
           curl -sf -X POST -H "Host: ${HOST}" -H "Content-Type: application/json" \
             -d '{"rows":[{"tenure_months":5,"monthly_charges":89.4,"support_calls":3,"contract":"month-to-month","internet_service":"fiber","payment_method":"e-check"}]}' \
-            http://127.0.0.1/predict; echo
+            http://127.0.0.1/predict \
+            || { [ "${CHAOS}" != "none" ] && echo "(chaos=${CHAOS}: failure expected, the canary analysis will judge it)"; } \
+            || exit 1
+          echo
 
-          SERVING=$(grep -o '"version":"[^"]*"' /tmp/health.json | head -1 | cut -d'"' -f4)
-          SERVING_ROLE=$(grep -o '"role":"[^"]*"' /tmp/health.json | head -1 | cut -d'"' -f4)
+          SERVING=$(grep -o '"version":"[^"]*"' "${RUNNER_TEMP}/health.json" | head -1 | cut -d'"' -f4)
+          SERVING_ROLE=$(grep -o '"role":"[^"]*"' "${RUNNER_TEMP}/health.json" | head -1 | cut -d'"' -f4)
           if [ "${SERVING}" != "${MODEL_VERSION}" ] || [ "${SERVING_ROLE}" != "${ROLE}" ]; then
             echo "Expected v${MODEL_VERSION} as ${ROLE}, pod reports v${SERVING} as ${SERVING_ROLE}"
             exit 1
           fi
-          grep -q '"enabled":true' /tmp/info.json \
+          grep -q '"enabled":true' "${RUNNER_TEMP}/info.json" \
             && echo "Prediction logging enabled" \
             || echo "::warning::Prediction logging is disabled on this pod"
           echo "Smoke test passed - v${SERVING} serving as ${SERVING_ROLE}"
 
+      - name: Follow the canary
+        if: env.ACTION == 'deploy' && env.CANARY == 'true'
+        timeout-minutes: 50
+        run: |
+          set -euo pipefail
+          get() { kubectl -n "${NS}" get rollout "${RELEASE}" -o jsonpath="$1"; }
+          echo "Traffic moves in steps; Prometheus analysis runs between them. Keep traffic flowing."
+          while true; do
+            PHASE=$(get '{.status.phase}'); ABORT=$(get '{.status.abort}')
+            STABLE=$(get '{.status.stableRS}'); CURRENT=$(get '{.status.currentPodHash}')
+            STEP=$(get '{.status.currentStepIndex}'); WEIGHT=$(get '{.status.canary.weights.canary.weight}')
+            echo "$(date +%H:%M:%S) phase=${PHASE} step=${STEP:-0} canary_weight=${WEIGHT:-0}% $(get '{.status.message}')"
+            if [ "${ABORT}" = "true" ] || [ "${PHASE}" = "Degraded" ]; then
+              echo "::error::Canary aborted by analysis - users are back on the previous version"
+              kubectl -n "${NS}" get analysisrun -l rollouts-pod-template-hash="${CURRENT}" \
+                -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.status.phase}{" "}{.status.message}{"\n"}{end}' || true
+              exit 1
+            fi
+            GEN=$(get '{.metadata.generation}'); OBSERVED=$(get '{.status.observedGeneration}')
+            if [ "${PHASE}" = "Healthy" ] && [ "${STABLE}" = "${CURRENT}" ] && [ "${GEN}" = "${OBSERVED}" ]; then
+              echo "Canary complete: 100% of traffic on v${MODEL_VERSION}"; break
+            fi
+            sleep 30
+          done
+
+      - name: Roll back the release
+        if: failure() && env.ACTION == 'deploy' && env.PREV_REVISION != ''
+        run: |
+          set -euo pipefail
+          if [ "${CANARY}" = "true" ]; then
+            # Stop any traffic shift still in progress, then restore the old spec.
+            kubectl -n "${NS}" patch rollout "${RELEASE}" --subresource=status --type=merge \
+              -p '{"status":{"abort":true}}' || true
+          fi
+          helm -n "${NS}" rollback "${RELEASE}" "${PREV_REVISION}" --wait --timeout 5m
+          echo "::warning::Rolled ${RELEASE} back to helm revision ${PREV_REVISION}"
+          echo "### Rolled back to revision ${PREV_REVISION}" >> "${GITHUB_STEP_SUMMARY}"
+
       - name: Wait for the champion to start mirroring
-        if: inputs.role == 'challenger'
+        if: env.ACTION == 'deploy' && inputs.role == 'challenger'
         run: |
           HOST="${MODEL_NAME}.${NODE_IP}.nip.io"
-          for i in $(seq 1 12); do
+          for _ in $(seq 1 12); do
             if curl -sf -H "Host: ${HOST}" http://127.0.0.1/info | grep -q '"active":true'; then
               echo "Champion is mirroring traffic to the challenger"; exit 0
             fi
@@ -146,7 +270,7 @@ jobs:
           echo "::warning::Champion has not picked up the challenger after 60s. Is the champion on the phase 3 image?"
 
       - name: Summary
-        if: always()
+        if: always() && env.ACTION == 'deploy'
         run: |
           {
             echo "### ${MODEL_NAME} v${MODEL_VERSION} as ${ROLE}"
@@ -154,9 +278,12 @@ jobs:
             echo "| | |"
             echo "|---|---|"
             echo "| Release | \`${RELEASE}\` |"
-            echo "| Image | \`${IMAGE}:v${MODEL_VERSION}\` |"
+            echo "| Image | \`${IMAGE}:${TAG}\` |"
+            echo "| Digest | \`${DIGEST:-not built}\` |"
             echo "| Endpoint | http://${RELEASE}.${NODE_IP}.nip.io |"
             if [ "${ROLE}" = "challenger" ]; then
               echo "| Traffic | shadow - mirrored from the champion, answers not returned |"
+            elif [ "${CANARY}" = "true" ]; then
+              echo "| Traffic | canary with automatic analysis (preview: http://${RELEASE}-canary.${NODE_IP}.nip.io) |"
             fi
           } >> "${GITHUB_STEP_SUMMARY}"

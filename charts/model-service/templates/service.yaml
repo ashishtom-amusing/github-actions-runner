@@ -1,7 +1,8 @@
+{{- $full := include "model-service.fullname" . }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "model-service.fullname" . }}
+  name: {{ $full }}
   labels: {{- include "model-service.labels" . | nindent 4 }}
 spec:
   selector: {{- include "model-service.selectorLabels" . | nindent 4 }}
@@ -9,3 +10,34 @@ spec:
     - name: http
       port: {{ .Values.service.port }}
       targetPort: http
+{{- if eq (include "model-service.useRollout" .) "true" }}
+---
+# Canary mode. Argo Rollouts pins the stable Service above and this one to
+# their ReplicaSets (it adds a rollouts-pod-template-hash selector).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-canary
+  labels: {{- include "model-service.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "model-service.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+---
+# Scrape target: every pod of the champion, stable and canary, exactly once.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $full }}-metrics
+  labels:
+    {{- include "model-service.labels" . | nindent 4 }}
+    mlops/metrics-service: "true"
+spec:
+  selector: {{- include "model-service.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+{{- end }}

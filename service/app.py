@@ -24,6 +24,7 @@ GET  /metrics   Prometheus
 from __future__ import annotations
 
 import os
+import random
 import threading
 import time
 import uuid
@@ -63,6 +64,12 @@ MODEL_INFO = Gauge("model_info", "Loaded model, as labels", ["model", "version",
 PREDICTIONS = Counter(
     "model_predictions_total", "Rows scored", ["model", "version", "role", "outcome"]
 )
+# DEMO ONLY: fault injection so a canary can be shown failing its analysis.
+CHAOS_ERROR_RATE = float(os.getenv("CHAOS_ERROR_RATE", "0") or 0)
+CHAOS_LATENCY_SECONDS = float(os.getenv("CHAOS_LATENCY_SECONDS", "0") or 0)
+if CHAOS_ERROR_RATE or CHAOS_LATENCY_SECONDS:
+    print(f"CHAOS enabled: error_rate={CHAOS_ERROR_RATE} latency={CHAOS_LATENCY_SECONDS}s")
+
 ERRORS = Counter("model_prediction_errors_total", "Failed requests", ["model", "version", "role"])
 LATENCY = Histogram(
     "model_prediction_latency_seconds",
@@ -309,6 +316,11 @@ def predict(
     # The champion mints the id; a challenger reuses it so rows line up.
     request_id = x_request_id or uuid.uuid4().hex
     start = time.perf_counter()
+    if CHAOS_LATENCY_SECONDS:
+        time.sleep(CHAOS_LATENCY_SECONDS)                     # DEMO: a slow model version
+    if CHAOS_ERROR_RATE and random.random() < CHAOS_ERROR_RATE:
+        ERRORS.labels(**LABELS).inc()                         # DEMO: a broken model version
+        raise HTTPException(status_code=500, detail="injected failure (chaos demo)")
     try:
         predictions, probabilities = model.predict(pd.DataFrame(request.rows))
     except Exception as exc:  # noqa: BLE001

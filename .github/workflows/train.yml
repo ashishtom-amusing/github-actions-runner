@@ -1,0 +1,185 @@
+name: Train model
+
+# A release tag on the model code starts a training run:
+#   git tag churn-classifier-v1.2.0 && git push origin churn-classifier-v1.2.0
+#
+# CI validates, packages and scans the code. It does NOT train: Airflow runs
+# the trainer image (pinned by digest), so a CI-started run and a drift-started
+# retrain execute the exact same path.
+on:
+  push:
+    tags: ["*-v*"]
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: "Model folder under models/"
+        required: true
+        default: "churn-classifier"
+      version:
+        description: "Image tag, e.g. v1.2.0"
+        required: true
+        default: "v0.0.0-manual"
+
+jobs:
+  # Lint and unit tests need nothing private, so they run on GitHub's runners.
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      model: ${{ steps.meta.outputs.model }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out model and version
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            REF="${GITHUB_REF_NAME}"            # churn-classifier-v1.2.0
+            MODEL="${REF%-v*}"                  # churn-classifier
+            VERSION="v${REF##*-v}"              # v1.2.0
+          else
+            MODEL="${{ inputs.model_name }}"
+            VERSION="${{ inputs.version }}"
+          fi
+          test -d "models/${MODEL}" || { echo "::error::No folder models/${MODEL} for tag ${GITHUB_REF_NAME}"; exit 1; }
+          echo "model=${MODEL}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Model ${MODEL}, version ${VERSION}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: models/${{ steps.meta.outputs.model }}/requirements*.txt
+
+      - name: Install
+        working-directory: models/${{ steps.meta.outputs.model }}
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        working-directory: models/${{ steps.meta.outputs.model }}
+        run: ruff check .
+
+      - name: Unit tests
+        working-directory: models/${{ steps.meta.outputs.model }}
+        run: pytest -q
+
+  # The image must be pullable by k3s and Airflow is on a private IP, so the
+  # remaining steps run on the self-hosted runner.
+  build:
+    needs: test
+    runs-on: [self-hosted, mana-k3s]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      MODEL: ${{ needs.test.outputs.model }}
+      VERSION: ${{ needs.test.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push trainer image
+        id: push
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository }}/${MODEL}-trainer"
+          docker build \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" "models/${MODEL}"
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+          # Airflow runs the image by digest: a re-pushed tag cannot change what trains.
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE}:${VERSION}")
+          echo "image=${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST#*@}" >> "$GITHUB_OUTPUT"
+          echo "Pushed ${IMAGE}:${VERSION} (${DIGEST})"
+
+      - name: Scan trainer image
+        id: scan
+        uses: ./.github/actions/image-scan
+        with:
+          image: ${{ steps.push.outputs.image }}
+          enforce: ${{ vars.IMAGE_SCAN_ENFORCE || 'true' }}
+
+      - name: Keep the SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ env.MODEL }}-trainer-${{ env.VERSION }}
+          path: ${{ steps.scan.outputs.sbom }}
+          retention-days: 30
+
+  trigger:
+    needs: [test, build]
+    runs-on: [self-hosted, mana-k3s]
+    env:
+      MODEL: ${{ needs.test.outputs.model }}
+      VERSION: ${{ needs.test.outputs.version }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+      AIRFLOW_URL: ${{ vars.AIRFLOW_URL }}
+      AIRFLOW_USERNAME: ${{ vars.AIRFLOW_USERNAME || 'admin' }}
+      AIRFLOW_PASSWORD: ${{ secrets.AIRFLOW_PASSWORD }}
+    steps:
+      - name: Start the Airflow training DAG
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, urllib.error, urllib.request
+
+          base = os.environ["AIRFLOW_URL"].rstrip("/")
+          dag_id = f"{os.environ['MODEL']}__train"
+
+          def call(method, path, body=None, token=None):
+              req = urllib.request.Request(
+                  base + path, method=method,
+                  data=json.dumps(body).encode() if body is not None else None,
+                  headers={"Content-Type": "application/json",
+                           **({"Authorization": f"Bearer {token}"} if token else {})})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.status, json.loads(r.read() or b"{}")
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode()
+
+          status, body = call("POST", "/auth/token", {"username": os.environ["AIRFLOW_USERNAME"],
+                                                      "password": os.environ["AIRFLOW_PASSWORD"]})
+          if status not in (200, 201):
+              sys.exit(f"Airflow login failed ({status}): {body}")
+          token = body["access_token"]
+
+          status, body = call("GET", f"/api/v2/dags/{dag_id}", token=token)
+          if status == 404:
+              sys.exit(f"DAG {dag_id} not found. Set 'phase: 3C' in dags/models/{os.environ['MODEL']}.yaml")
+          if status != 200:
+              sys.exit(f"Could not read {dag_id} ({status}): {body}")
+          if body.get("is_paused"):
+              # A run on a paused DAG would sit queued forever.
+              call("PATCH", f"/api/v2/dags/{dag_id}", {"is_paused": False}, token)
+              print(f"Unpaused {dag_id}")
+
+          # logical_date has no default in Airflow 3's API model: it must be sent, as null.
+          status, body = call("POST", f"/api/v2/dags/{dag_id}/dagRuns", {
+              "logical_date": None,
+              "conf": {"image_tag": os.environ["VERSION"], "image_digest": os.environ.get("DIGEST", ""),
+                       "git_sha": os.environ["GITHUB_SHA"], "reason": "ci", "data_source": "curated"},
+              "note": f"CI {os.environ['GITHUB_REF_NAME']} ({os.environ['GITHUB_SHA'][:7]})",
+          }, token)
+          if status not in (200, 201):
+              sys.exit(f"Trigger failed ({status}): {body}")
+          run_id = body["dag_run_id"]
+          url = f"{base}/dags/{dag_id}/runs/{run_id}"
+          print(f"Started {dag_id} run {run_id}\n{url}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(f"### Training started\n\n| | |\n|---|---|\n"
+                       f"| DAG | `{dag_id}` |\n| Run | [{run_id}]({url}) |\n"
+                       f"| Trainer | `{os.environ['VERSION']}` |\n"
+                       f"| Digest | `{os.environ.get('DIGEST', '-')}` |\n"
+                       f"| Data | last curated days (falls back to the seed files) |\n\n"
+                       f"Promotion waits for approval in Airflow after training.\n")
+          PY

@@ -1,0 +1,36 @@
+{{- if eq (include "model-service.useRollout" .) "true" }}
+{{- $full := include "model-service.fullname" . }}
+# Canary mode (phase 3E). Argo Rollouts moves user traffic to a new version in
+# steps through the TraefikService weights, and runs the AnalysisTemplate
+# between steps. A failed analysis aborts: all traffic goes back to the stable
+# version without anyone acting.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ $full }}
+  labels: {{- include "model-service.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels: {{- include "model-service.selectorLabels" . | nindent 6 }}
+  template: {{- include "model-service.podTemplate" . | nindent 4 }}
+  strategy:
+    canary:
+      stableService: {{ $full }}
+      canaryService: {{ $full }}-canary
+      trafficRouting:
+        traefik:
+          weightedTraefikServiceName: {{ $full }}
+      steps:
+        {{- range .Values.rollout.weights }}
+        - setWeight: {{ . }}
+        - pause: { duration: {{ $.Values.rollout.pause }} }
+        - analysis:
+            templates:
+              - templateName: {{ $full }}-canary-health
+            args:
+              - name: version
+                value: {{ $.Values.modelVersion | quote }}
+        {{- end }}
+{{- end }}

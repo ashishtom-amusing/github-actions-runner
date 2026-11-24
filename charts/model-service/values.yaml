@@ -50,3 +50,23 @@ shadow:
   maxInflight: 32
 
 terminationGracePeriodSeconds: 30
+
+# Canary releases for the champion (phase 3E) with Argo Rollouts.
+#   auto   use a Rollout when the Argo Rollouts CRDs are installed, else a Deployment
+#   true / false   force it
+rollout:
+  enabled: auto
+  weights: [20, 50]        # traffic steps; 100% follows the last successful analysis
+  pause: 2m                # let metrics accumulate at each step
+  analysis:
+    prometheusAddress: http://prometheus-operated.monitoring.svc.cluster.local:9090
+    interval: 1m
+    count: 3               # measurements per analysis step
+    window: 2m
+    minRequests: 5         # requests the canary must serve in the window
+    maxErrorRate: 0.02
+    maxP95LatencySeconds: 0.5
+
+# DEMO ONLY: inject faults into this version so its canary fails analysis.
+#   none | errors (50% of requests fail) | slow (+0.8s per request)
+chaos: none
